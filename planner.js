@@ -39,7 +39,7 @@ export function makeApi(base, fetchFn = (...a) => fetch(...a)) {
         code: s.code, uic: String(s.UICCode ?? s.uicCode ?? ''),
         name: s.namen?.lang || s.namen?.middel || s.name || s.code,
         alt: [s.namen?.middel, s.namen?.kort, ...(s.synoniemen || [])].filter(Boolean),
-        land: s.land,
+        land: s.land, lat: s.lat, lng: s.lng,
       })).filter(s => s.code);
       byUic = new Map(stations.map(s => [s.uic, s]));
       byCode = new Map(stations.map(s => [s.code.toUpperCase(), s]));
@@ -54,9 +54,42 @@ export function makeApi(base, fetchFn = (...a) => fetch(...a)) {
   };
 }
 
+export async function refreshLeg(api, leg) {
+  if (leg.walk || !leg.train) return leg;
+  const a = api.station(leg.from.uic), b = api.station(leg.to.uic);
+  if (!a || !b) return leg;
+  const trips = await api.trips(a, b, new Date(leg.from.planned.getTime() - 2 * MIN));
+  for (const t of trips) for (const l of t.legs) if (l.train === leg.train) return { ...l, xNext: leg.xNext ?? l.xNext };
+  return { ...leg, missing: true };
+}
+
 function place(o) {
   return { uic: String(o?.uicCode ?? ''), name: o?.name || '', time: parseNS(o?.actualDateTime || o?.plannedDateTime),
-    planned: parseNS(o?.plannedDateTime), track: o?.actualTrack || o?.plannedTrack || '' };
+    planned: parseNS(o?.plannedDateTime), track: o?.actualTrack || o?.plannedTrack || '', plannedTrack: o?.plannedTrack || '' };
+}
+
+// Which track pairs are on the same platform. NS flags this for the transfers in its own trips
+// (leg.crossPlatformTransfer). We remember every answer, so transfers we invent ourselves can use it too.
+export const platforms = new Map();
+const pkey = (uic, a, b) => `${uic}|${a}|${b}`;
+export function learnPlatform(uic, a, b, v) {
+  if (!uic || !a || !b || typeof v !== 'boolean') return;
+  platforms.set(pkey(uic, a, b), v); platforms.set(pkey(uic, b, a), v);
+}
+// Neighbouring numbers with the same letter (5→6, 10b→11b) are usually the two sides of one island.
+// Different letters (9a→8b) mean opposite ends, so those are never assumed.
+function likelyIsland(a, b) {
+  const m = /^(\d+)([a-z]?)$/i, x = String(a).match(m), y = String(b).match(m);
+  return !!x && !!y && Math.abs(+x[1] - +y[1]) === 1 && (x[2] || '').toLowerCase() === (y[2] || '').toLowerCase();
+}
+export function platformKind(uic, a, b, nsFlag) {
+  if (a && a === b && !String(a).includes('-')) return 'same';
+  if (nsFlag === true) return 'cross';
+  if (nsFlag === false) return 'other';
+  const k = platforms.get(pkey(uic, a, b));
+  if (k === true) return 'cross';
+  if (k === false) return 'other';
+  return likelyIsland(a, b) ? 'likely' : 'other';
 }
 
 export function normLeg(leg) {
@@ -78,12 +111,17 @@ export function normLeg(leg) {
     train: String(pr.number ?? ''), cat: pr.shortCategoryName || pr.categoryCode || '',
     label: pr.displayName || pr.longCategoryName || leg.name || 'Trein',
     direction: leg.direction || '', cancelled: !!leg.cancelled,
+    xNext: typeof leg.crossPlatformTransfer === 'boolean' ? leg.crossPlatformTransfer : undefined,
   };
 }
 
 export function normTrip(t) {
   if (!t?.legs?.length) return null;
   const legs = t.legs.map(normLeg);
+  for (let i = 0; i < legs.length - 1; i++) {
+    const a = legs[i], b = legs[i + 1];
+    if (!a.walk && !b.walk) learnPlatform(b.from.uic || a.to.uic, a.to.track, b.from.track, a.xNext);
+  }
   return { legs, status: t.status || 'NORMAL', source: 'ns' };
 }
 
@@ -98,11 +136,13 @@ export function transfers(it, minT) {
     const a = it.legs[i - 1], b = it.legs[i];
     if (a.walk || b.walk) continue;
     const gap = minutes(a.to.time, b.from.time);
-    // Same track means walking across the platform, but a combined track like "1-2" is a whole
-    // island, and a train can't leave the second the other one arrives: keep at least 1 minute.
-    const same = !!a.to.track && a.to.track === b.from.track && !a.to.track.includes('-');
-    out.push({ at: b.from.name, gap, fromTrack: a.to.track, toTrack: b.from.track, same,
-      ok: gap >= (same ? Math.min(1, minT) : minT), tight: !same && gap < 5 });
+    // Across the platform takes a few steps, so 1 minute is enough there (a train can't leave the
+    // second the other arrives). "likely" is only a guess from the track numbers, so it keeps the
+    // normal margin but is not called tight. Everything else needs your margin and is tight under 5.
+    const kind = platformKind(b.from.uic || a.to.uic, a.to.track, b.from.track, a.xNext);
+    const near = kind === 'same' || kind === 'cross';
+    out.push({ at: b.from.name, gap, fromTrack: a.to.track, toTrack: b.from.track, kind, same: near,
+      ok: gap >= (near ? Math.min(1, minT) : minT), tight: kind === 'other' && gap < 5 });
   }
   return out;
 }
@@ -118,7 +158,7 @@ const key = it => rides(it).map(l => `${l.train}@${l.from.uic}>${l.to.uic}`).joi
 
 function truncate(leg, k) {
   const s = leg.stops[k];
-  return { ...leg, stops: leg.stops.slice(0, k + 1), to: { uic: s.uic, name: s.name, time: s.arr, planned: s.arr, track: s.arrTrack } };
+  return { ...leg, xNext: undefined, stops: leg.stops.slice(0, k + 1), to: { uic: s.uic, name: s.name, time: s.arr, planned: s.arr, track: s.arrTrack, plannedTrack: s.arrTrack } };
 }
 
 function splice(it, i, k, tail) {
@@ -127,7 +167,7 @@ function splice(it, i, k, tail) {
   const t0 = tail.legs[0];
   if (t0 && !t0.walk && t0.train && t0.train === cut.train) {
     // Same train continues: merge instead of inventing a transfer.
-    legs[legs.length - 1] = { ...cut, to: t0.to, stops: [...cut.stops, ...t0.stops.slice(1)] };
+    legs[legs.length - 1] = { ...cut, to: t0.to, xNext: t0.xNext, stops: [...cut.stops, ...t0.stops.slice(1)] };
     legs.push(...tail.legs.slice(1));
   } else legs.push(...tail.legs);
   return { legs, status: 'NORMAL', source: 'replan', via: cut.to.name };
