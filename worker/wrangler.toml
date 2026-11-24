@@ -1,0 +1,7 @@
+name = "ns-snel"
+main = "worker.js"
+compatibility_date = "2026-11-01"
+
+[vars]
+# Only this site may use the proxy. Add http://localhost:8766 while testing locally.
+ALLOWED_ORIGIN = "https://picklerick16.github.io,http://localhost:8766"
